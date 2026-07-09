@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# ws — per-branch git worktree "workspaces" for parallel Claude Code sessions.
+#
+# Portable core: bash 3.2+ (macOS default), Linux, Git Bash, WSL. zsh users get it
+# too since it's an external command. Windows-native uses the PowerShell port.
+#
+# `ws cd` needs the shell-function wrapper (shell/hook.*) to change the *calling*
+# shell's directory; the bare command falls back to spawning a subshell.
+#
+# Full docs: README.md.  No strict mode on purpose — many git calls "fail" as
+# control flow and `set -e` would abort on them.
+
+WS_VERSION="2.0.0"
+
+# --------------------------------------------------------------------------- #
+# self-location (resolve symlinks; bash 3.2 friendly)
+# --------------------------------------------------------------------------- #
+_ws_self_dir() {
+  local src="${BASH_SOURCE[0]:-$0}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+WS_SELF_DIR="$(_ws_self_dir)"
+
+# find a bundled asset in either the installed (flat) or repo layout
+_ws_asset() {
+  local n="$1" c
+  for c in "$WS_SELF_DIR/$n" "$WS_SELF_DIR/../common/$n" "$WS_SELF_DIR/../macos/$n" "$WS_SELF_DIR/../lib/$n"; do
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# --------------------------------------------------------------------------- #
+# config + defaults
+# --------------------------------------------------------------------------- #
+WS_CONFIG_DIR="${WS_CONFIG_DIR:-$HOME/.config/ws}"
+[ -f "$WS_CONFIG_DIR/config" ] && . "$WS_CONFIG_DIR/config"
+: "${WS_HOME:=$HOME/worktrees}"
+# Seeded into each new worktree (gitignored local files a fresh checkout lacks).
+# .claude/settings.local.json carries your approved Claude permissions across
+# workspaces so Claude doesn't re-prompt in every one.
+: "${WS_COPY:=.env .claude/settings.local.json}"
+: "${WS_EDITOR:=auto}"
+: "${WS_IDEA_WAIT:=15}"
+
+# --------------------------------------------------------------------------- #
+# tiny helpers
+# --------------------------------------------------------------------------- #
+_ws_is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+_ws_say()    { printf 'ws: %s\n' "$*"; }
+_ws_err()    { printf 'ws: %s\n' "$*" >&2; }
+_ws_die()    { _ws_err "$*"; exit 1; }
+
+_ws_in_repo()      { git rev-parse --git-dir >/dev/null 2>&1; }
+_ws_require_repo() { _ws_in_repo || _ws_die "not inside a git repo"; }
+
+# name of the MAIN repo (works from the main checkout or any linked worktree)
+_ws_repo_name() {
+  local main
+  main="$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | head -1)"
+  [ -n "$main" ] || return 1
+  basename "$main"
+}
+_ws_base() { printf '%s/%s\n' "$WS_HOME" "$(_ws_repo_name)"; }
+_ws_dir()  { printf '%s/%s/%s\n' "$WS_HOME" "$(_ws_repo_name)" "$1"; }
+
+_ws_valid_name() {
+  case "$1" in
+    ""|*" "*|*/*|.*) return 1 ;;   # no empty / spaces / slashes / leading dot
+  esac
+  return 0
+}
+
+_ws_names() {           # one workspace name per line for the current repo
+  _ws_in_repo || return 0
+  local base; base="$(_ws_base)"
+  [ -d "$base" ] || return 0
+  ls -1 "$base" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------- #
+# seeding + marker
+# --------------------------------------------------------------------------- #
+_ws_seed() {
+  local dir="$1" root repo f line seedlist
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  repo="$(_ws_repo_name)"
+  local -a files=()
+  for f in $WS_COPY; do files+=("$f"); done
+  seedlist="$WS_CONFIG_DIR/seed/$repo.txt"
+  if [ -f "$seedlist" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && files+=("$line"); done < "$seedlist"
+  fi
+  for f in "${files[@]}"; do
+    [ -n "$f" ] || continue
+    if [ -e "$root/$f" ] && [ ! -e "$dir/$f" ]; then
+      mkdir -p "$dir/$(dirname "$f")" 2>/dev/null
+      cp -R "$root/$f" "$dir/$f" 2>/dev/null && _ws_say "seeded $f"
+    fi
+  done
+}
+
+# One-shot marker read by the shell hook. mode: fresh|continue|prompt
+_ws_mark() {
+  local dir="$1" mode="$2" payload="${3:-}"
+  { printf '%s\n' "$mode"; [ -n "$payload" ] && printf '%s' "$payload"; } > "$dir/.ws-autoclaude"
+}
+
+# --------------------------------------------------------------------------- #
+# editor
+# --------------------------------------------------------------------------- #
+_ws_resolve_editor() {
+  case "$WS_EDITOR" in
+    none) printf 'none\n' ;;
+    auto)
+      if   command -v idea   >/dev/null 2>&1; then printf 'idea\n'
+      elif command -v code   >/dev/null 2>&1; then printf 'code\n'
+      elif command -v cursor >/dev/null 2>&1; then printf 'cursor\n'
+      else printf 'none\n'; fi ;;
+    *) printf '%s\n' "$WS_EDITOR" ;;
+  esac
+}
+
+_ws_open() {
+  local dir="$1" name="$2" ed
+  ed="$(_ws_resolve_editor)"
+  _ws_say "$name -> $dir"
+  if [ "$ed" = none ]; then
+    _ws_say "no editor (WS_EDITOR=none). Enter it with: ws cd $name   (then: claude)"
+    return 0
+  fi
+  if ! command -v "$ed" >/dev/null 2>&1; then
+    _ws_say "editor '$ed' not on PATH — open $dir manually, then run: claude"
+    return 0
+  fi
+  "$ed" "$dir" >/dev/null 2>&1 || { _ws_say "'$ed' failed to open $dir"; return 0; }
+
+  if [ "$ed" = idea ] && _ws_is_mac && [ -z "${WS_NO_UI:-}" ]; then
+    local applescript; applescript="$(_ws_asset idea_open.applescript)" || return 0
+    local do_term=1 do_merge=1 err
+    [ -n "${WS_NO_TERMINAL:-}" ] && do_term=0
+    [ -n "${WS_NO_MERGE:-}" ]    && do_merge=0
+    err="$(osascript "$applescript" "$name" "$do_term" "$do_merge" "$WS_IDEA_WAIT" 2>&1 >/dev/null)" || {
+      _ws_say "IntelliJ automation failed (${err:-no message})."
+      printf '    Grant the app you run ws from (Terminal/IntelliJ) BOTH Accessibility AND\n' >&2
+      printf '    Automation (System Events), then quit & reopen it. Or set WS_NO_UI=1.\n' >&2
+      printf '    Meanwhile: in IntelliJ press Opt+F12 and Claude auto-starts.\n' >&2
+    }
+  else
+    _ws_say "open the editor terminal in this folder and Claude auto-starts (marker hook)."
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# picker (fzf if present, else numbered)
+# --------------------------------------------------------------------------- #
+_ws_pick() {
+  local -a names=(); local n
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done <<EOF
+$(_ws_names)
+EOF
+  if [ "${#names[@]}" -eq 0 ]; then
+    _ws_err "no workspaces for '$(_ws_repo_name)' — create one: ws -n <name>"
+    return 1
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${names[@]}" | fzf --prompt="ws> " --height=40% --reverse --no-multi
+    return $?
+  fi
+  local i=1
+  { printf 'workspaces for %s:\n' "$(_ws_repo_name)"
+    for n in "${names[@]}"; do printf '  %d) %s\n' "$i" "$n"; i=$((i+1)); done
+    printf 'select [1-%d]: ' "${#names[@]}"; } >&2
+  local choice; read -r choice
+  case "$choice" in ''|*[!0-9]*) _ws_err "cancelled"; return 1 ;; esac
+  if [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
+    printf '%s\n' "${names[$((choice-1))]}"
+  else
+    _ws_err "cancelled"; return 1
+  fi
+}
+
+# resolve a name arg, falling back to the picker
+_ws_resolve_name() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then name="$(_ws_pick)" || return 1; fi
+  [ -n "$name" ] || return 1
+  printf '%s\n' "$name"
+}
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+_ws_cmd_new() {
+  local name="" base="" prompt=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--prompt) shift; prompt="${1:-}" ;;
+      --)          shift; prompt="$*"; break ;;
+      -*)          _ws_err "ignoring unknown flag: $1" ;;
+      *)           if [ -z "$name" ]; then name="$1"; elif [ -z "$base" ]; then base="$1"; fi ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || _ws_die "usage: ws new <name> [base-ref] [-- <claude prompt>]"
+  _ws_valid_name "$name" || _ws_die "invalid name '$name' (no spaces, slashes, or leading dot)"
+  _ws_require_repo
+  local dir; dir="$(_ws_dir "$name")"
+  [ -e "$dir" ] && _ws_die "workspace exists: $dir  (resume: ws -r $name)"
+  mkdir -p "$(_ws_base)"
+  if git show-ref --verify --quiet "refs/heads/$name"; then
+    git worktree add "$dir" "$name" || return 1
+  elif git ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
+    git worktree add --track -b "$name" "$dir" "origin/$name" || return 1
+  elif [ -n "$base" ]; then
+    git worktree add -b "$name" "$dir" "$base" || return 1
+  else
+    git worktree add -b "$name" "$dir" || return 1
+  fi
+  _ws_seed "$dir"
+  _ws_mark "$dir" "${prompt:+prompt}" "$prompt"
+  _ws_open "$dir" "$name"
+}
+
+_ws_cmd_resume() {
+  _ws_require_repo
+  local name; name="$(_ws_resolve_name "${1:-}")" || return 1
+  local dir; dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || _ws_die "no such workspace: $name"
+  _ws_mark "$dir" continue ""
+  _ws_open "$dir" "$name"
+}
+
+_ws_cmd_path() {
+  _ws_require_repo
+  local name; name="$(_ws_resolve_name "${1:-}")" || return 1
+  local dir; dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || _ws_die "no such workspace: $name"
+  printf '%s\n' "$dir"
+}
+
+_ws_cmd_cd() {   # standalone fallback; the shell wrapper does a real parent cd
+  local dir; dir="$(_ws_cmd_path "$@")" || return 1
+  [ -n "$dir" ] || return 1
+  _ws_say "entering $dir (exit to return)"
+  cd "$dir" || return 1
+  exec "${SHELL:-/bin/bash}"
+}
+
+_ws_cmd_ls() {
+  _ws_require_repo
+  local base repo; base="$(_ws_base)"; repo="$(_ws_repo_name)"
+  if [ ! -d "$base" ] || [ -z "$(ls -A "$base" 2>/dev/null)" ]; then
+    _ws_say "no workspaces for '$repo' — create one: ws -n <name>"; return 0
+  fi
+  printf 'workspaces for %s  (%s):\n' "$repo" "$base"
+  local n dir branch dirty up ab behind ahead dock rel
+  for n in $(_ws_names); do
+    dir="$base/$n"; [ -d "$dir" ] || continue
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then dirty="● dirty"; else dirty="✓ clean"; fi
+    up="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+    ab=""
+    if [ -n "$up" ]; then
+      read behind ahead <<< "$(git -C "$dir" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)"
+      [ "${ahead:-0}" -gt 0 ] 2>/dev/null && ab="$ab ↑$ahead"
+      [ "${behind:-0}" -gt 0 ] 2>/dev/null && ab="$ab ↓$behind"
+    else
+      ab=" (no upstream)"
+    fi
+    if ls "$dir"/*.override.y*ml >/dev/null 2>&1; then dock=" · docker"; else dock=""; fi
+    rel="$(git -C "$dir" log -1 --format=%cr 2>/dev/null)"
+    printf '  %-26s %-14s %s%s%s · %s\n' "$n" "$branch" "$dirty" "$ab" "$dock" "${rel:-—}"
+  done
+}
+
+_ws_cmd_rm() {
+  _ws_require_repo
+  local force=0 delbranch=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force)  force=1 ;;
+      -b|--branch) delbranch=1 ;;
+      -*)          _ws_err "ignoring unknown flag: $1" ;;
+      *)           name="$1" ;;
+    esac; shift
+  done
+  name="$(_ws_resolve_name "$name")" || return 1
+  local dir; dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || _ws_die "no such workspace: $name"
+  if [ "$force" -eq 0 ]; then
+    local issues="" ahead up
+    [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && issues="uncommitted changes"
+    up="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+    if [ -n "$up" ]; then
+      ahead="$(git -C "$dir" rev-list --count '@{u}..HEAD' 2>/dev/null)"
+      [ "${ahead:-0}" -gt 0 ] 2>/dev/null && issues="${issues:+$issues, }$ahead unpushed commit(s)"
+    fi
+    if [ -n "$issues" ]; then
+      _ws_err "workspace '$name' has $issues."
+      printf 'ws: remove anyway? [y/N] ' >&2; local ans; read -r ans
+      case "$ans" in y|Y|yes|YES) ;; *) _ws_err "aborted"; return 1 ;; esac
+    fi
+  fi
+  if [ "$force" -eq 1 ]; then
+    git worktree remove --force "$dir" || _ws_die "could not remove worktree"
+  else
+    git worktree remove "$dir" 2>/dev/null || { _ws_err "worktree busy/dirty — retry with: ws rm $name --force"; return 1; }
+  fi
+  git worktree prune
+  _ws_say "removed workspace '$name'"
+  if [ "$delbranch" -eq 1 ]; then
+    git branch -D "$name" 2>/dev/null && _ws_say "deleted branch '$name'" || _ws_err "could not delete branch '$name'"
+  else
+    _ws_say "branch '$name' kept — delete with: git branch -D $name"
+  fi
+}
+
+_ws_cmd_seed() {
+  _ws_require_repo
+  local name; name="$(_ws_resolve_name "${1:-}")" || return 1
+  local dir; dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || _ws_die "no such workspace: $name"
+  _ws_seed "$dir"; _ws_say "re-seeded $name"
+}
+
+_ws_cmd_docker() {
+  _ws_require_repo
+  local name="${1:-}" arg2="${2:-}" off=0 slot=0
+  if [ "$name" = off ]; then off=1; name="${2:-}"; arg2=""; fi
+  [ "$arg2" = off ] && off=1
+  case "$arg2" in ''|off|*[!0-9]*) ;; *) slot="$arg2" ;; esac
+  name="$(_ws_resolve_name "$name")" || return 1
+  local dir; dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || _ws_die "no such workspace: $name"
+  local base="" f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [ -f "$dir/$f" ] && { base="$f"; break; }
+  done
+  [ -n "$base" ] || _ws_die "no compose file in $dir — nothing to isolate"
+  local stem="${base%.*}" ext="${base##*.}" override
+  override="$stem.override.$ext"
+  if [ "$off" -eq 1 ]; then
+    rm -f "$dir/$override" && _ws_say "docker isolation OFF for '$name' (removed $override)"; return 0
+  fi
+  local py gen out excl
+  py="$(command -v python3 || command -v python)" || _ws_die "python not found (needed for ws -d)"
+  gen="$(_ws_asset gen_override.py)" || _ws_die "gen_override.py not found next to ws"
+  out="$("$py" "$gen" "$dir/$base" "$name" "$slot" "$(_ws_repo_name)")" || return 1
+  excl="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+  [ -f "$excl" ] && { grep -qxF "$override" "$excl" 2>/dev/null || printf '%s\n' "$override" >> "$excl"; }
+  _ws_say "docker isolation ON for '$name'  (project: $(printf '%s\n' "$out" | sed -n 2p))"
+  printf '%s\n' "$out" | sed -n '3,$p' | sed 's/^port /  /'
+  printf '  run:     cd "%s" && make run   (auto-merges %s)\n' "$dir" "$override"
+  printf '  disable: ws -d %s off\n' "$name"
+}
+
+_ws_check() {   # _ws_check "label" "shell test cmd"
+  if eval "$2" >/dev/null 2>&1; then printf '  [ok] %s\n' "$1"; else printf '  [--] %s\n' "$1"; fi
+}
+_ws_cmd_doctor() {
+  local py; py="$(command -v python3 || command -v python || echo python3)"
+  printf 'ws doctor — v%s (%s)\n' "$WS_VERSION" "$(uname -s)"
+  printf '  config dir : %s%s\n' "$WS_CONFIG_DIR" "$( [ -f "$WS_CONFIG_DIR/config" ] && echo ' (config loaded)')"
+  printf '  worktrees  : %s\n' "$WS_HOME"
+  printf '  editor     : %s -> %s\n' "$WS_EDITOR" "$(_ws_resolve_editor)"
+  printf '  seed files : %s\n' "$WS_COPY"
+  _ws_check "git"                     "command -v git"
+  _ws_check "claude CLI"              "command -v claude"
+  _ws_check "editor launcher"         "[ \"$(_ws_resolve_editor)\" = none ] || command -v $(_ws_resolve_editor)"
+  _ws_check "python (for ws -d)"      "command -v python3 || command -v python"
+  _ws_check "PyYAML (for ws -d)"      "$py -c 'import yaml'"
+  _ws_check "docker compose (ws -d)"  "docker compose version"
+  _ws_check "fzf (fuzzy picker)"      "command -v fzf"
+  if _ws_is_mac; then
+    if osascript -e 'tell application "System Events" to return name of first process' >/dev/null 2>&1; then
+      printf '  [ok] macOS Accessibility/Automation for this terminal\n'
+    else
+      printf '  [--] macOS Accessibility/Automation — grant it (see README) or set WS_NO_UI=1\n'
+    fi
+  fi
+  if _ws_in_repo; then printf '  repo       : %s  (%s workspaces)\n' "$(_ws_repo_name)" "$(_ws_names | grep -c . )"; fi
+}
+
+_ws_help() {
+  cat <<EOF
+ws v$WS_VERSION — per-branch worktree workspaces (open in your editor + Claude)
+
+  ws -n <name> [base] [-- <prompt>]  new workspace; optional Claude starting prompt
+  ws            (or ws -r)           resume: pick a workspace (fzf/menu) + open it
+  ws -r <name>                       resume a specific one (Claude --continue)
+  ws cd [name]                       cd this shell into a workspace (needs shell hook)
+  ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
+  ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
+  ws seed [name]                     re-copy seed files (e.g. after .env changed)
+  ws -d [name] [slot|off]            isolate docker stack for concurrent runs (slot 1-5)
+  ws doctor                          check your environment
+  ws version | -h
+
+worktrees: $WS_HOME/<repo>/<name>     config: $WS_CONFIG_DIR/config
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+# dispatch
+# --------------------------------------------------------------------------- #
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    new|-n|--new)                shift; _ws_cmd_new "$@" ;;
+    resume|switch|-r|--resume)   shift; _ws_cmd_resume "$@" ;;
+    cd)                          shift; _ws_cmd_cd "$@" ;;
+    path|--print-dir)            shift; _ws_cmd_path "$@" ;;
+    ls|list|status|-l|--list)    shift; _ws_cmd_ls ;;
+    rm|remove|-rm|--remove)      shift; _ws_cmd_rm "$@" ;;
+    seed)                        shift; _ws_cmd_seed "$@" ;;
+    docker|-d|--docker)          shift; _ws_cmd_docker "$@" ;;
+    doctor)                      shift; _ws_cmd_doctor ;;
+    --list-names)                _ws_names ;;                 # completion helper
+    version|-v|--version)        printf 'ws %s\n' "$WS_VERSION" ;;
+    help|-h|--help)              _ws_help ;;
+    "")                          _ws_cmd_resume ;;
+    -*)                          _ws_err "unknown option '$cmd'"; _ws_help; exit 1 ;;
+    *)
+      if _ws_in_repo && [ -d "$(_ws_dir "$cmd")" ]; then _ws_cmd_resume "$cmd"
+      else _ws_err "unknown command '$cmd' (new workspace? ws -n \"$cmd\")"; exit 1; fi ;;
+  esac
+}
+main "$@"

@@ -1,0 +1,27 @@
+# ws config — copy to ~/.config/ws/config and edit. Sourced by the `ws` command
+# (plain shell assignments). Every value has a sane default; uncomment to override.
+
+# Where worktrees live: $WS_HOME/<repo>/<workspace>
+# WS_HOME="$HOME/worktrees"
+
+# Gitignored files copied into each new worktree (space-separated).
+# Default seeds your env + Claude permissions so agents don't re-prompt.
+# WS_COPY=".env .claude/settings.local.json"
+
+# Editor to open workspaces in: auto | idea | code | cursor | none | <any command>
+# 'auto' prefers idea, then code, then cursor.
+# WS_EDITOR="auto"
+
+# macOS/IntelliJ only — seconds to wait for the project window before giving up.
+# WS_IDEA_WAIT=15
+
+# macOS/IntelliJ automation toggles (leave unset to enable):
+# WS_NO_UI=1         # don't run the AppleScript at all (just open the project)
+# WS_NO_MERGE=1      # open + terminal, but don't "Merge All Project Windows"
+# WS_NO_TERMINAL=1   # open + merge, but don't auto-open the terminal
+
+# Per-repo extra seed files: create ~/.config/ws/seed/<repo>.txt with one
+# relative path per line (nested paths ok). Example ~/.config/ws/seed/api.txt:
+#   .env
+#   .claude/settings.local.json
+#   config/local.settings.json
