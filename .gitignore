@@ -1,0 +1,5 @@
+# nothing to build; this repo is just scripts + docs.
+.DS_Store
+*.scpt
+__pycache__/
+*.pyc
