@@ -24,13 +24,36 @@ function _ws-InRepo {
   git rev-parse --git-dir *> $null
   return ($LASTEXITCODE -eq 0)
 }
-function _ws-RepoName {
+function _ws-MainPath {
   $line = git worktree list --porcelain 2>$null | Select-String '^worktree ' | Select-Object -First 1
-  if (-not $line) { return $null }
-  return (Split-Path ($line.ToString() -replace '^worktree ', '') -Leaf)
+  if ($line) { return ($line.ToString() -replace '^worktree ', '') }
+}
+function _ws-RepoName {
+  $m = _ws-MainPath
+  if ($m) { return (Split-Path $m -Leaf) }
 }
 function _ws-Base { Join-Path $env:WS_HOME (_ws-RepoName) }
 function _ws-Dir($name) { Join-Path (_ws-Base) $name }
+
+# Where sibling repos live (for -a): $env:WS_CODE_ROOT (';'-separated) or the
+# parent of the current repo's main checkout.
+function _ws-CodeRoots {
+  if ($env:WS_CODE_ROOT) { return @($env:WS_CODE_ROOT -split ';' | Where-Object { $_ }) }
+  return @(Split-Path (_ws-MainPath) -Parent)
+}
+function _ws-ResolveRepo($nm) {
+  if ($nm -match '[\\/]' -or $nm.StartsWith('~') -or $nm.StartsWith('.')) {
+    $cand = $nm -replace '^~', $HOME
+    $tl = git -C $cand rev-parse --show-toplevel 2>$null
+    if ($tl) { return $tl } else { return $null }
+  }
+  foreach ($root in (_ws-CodeRoots)) {
+    $p = Join-Path $root $nm
+    git -C $p rev-parse --git-dir *> $null
+    if ($LASTEXITCODE -eq 0) { return $p }
+  }
+  return $null
+}
 
 function _ws-ValidName($name) {
   if (-not $name) { return $false }
@@ -112,22 +135,10 @@ function _ws-ResolveName($name) {
 }
 
 # ---- commands ---------------------------------------------------------------
-function _ws-New([string[]]$a) {
-  $name = ''; $base = ''; $prompt = ''
-  $i = 0
-  while ($i -lt $a.Count) {
-    switch -Regex ($a[$i]) {
-      '^(-p|--prompt)$' { $i++; $prompt = $a[$i] }
-      '^--$'            { $i++; if ($i -lt $a.Count) { $prompt = ($a[$i..($a.Count - 1)] -join ' ') }; $i = $a.Count }
-      default { if (-not $name) { $name = $a[$i] } elseif (-not $base) { $base = $a[$i] } }
-    }
-    $i++
-  }
-  if (-not $name) { _ws-Err "usage: ws new <name> [base-ref] [-- <claude prompt>]"; return }
-  if (-not (_ws-ValidName $name)) { _ws-Err "invalid name '$name' (no spaces, slashes, or leading dot)"; return }
-  if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
+# --- per-repo primitives (assume the current location is inside the repo) ----
+function _ws-DoNewOne($name, $base, $prompt) {
   $dir = _ws-Dir $name
-  if (Test-Path $dir) { _ws-Err "workspace exists: $dir  (resume: ws -r $name)"; return }
+  if (Test-Path $dir) { _ws-Err "[$(_ws-RepoName)] workspace exists: $dir"; return }
   New-Item -ItemType Directory -Force -Path (_ws-Base) *> $null
   git show-ref --verify --quiet "refs/heads/$name"
   if ($LASTEXITCODE -eq 0) {
@@ -143,14 +154,76 @@ function _ws-New([string[]]$a) {
   if ($prompt) { _ws-Mark $dir 'prompt' $prompt } else { _ws-Mark $dir '' '' }
   _ws-Open $dir $name
 }
+function _ws-DoResumeOne($name) {
+  $dir = _ws-Dir $name
+  if (-not (Test-Path $dir)) { _ws-Err "[$(_ws-RepoName)] no such workspace: $name"; return }
+  _ws-Mark $dir 'continue' ''
+  _ws-Open $dir $name
+}
+function _ws-DoEnsureOne($name, $base, $prompt) {
+  $dir = _ws-Dir $name
+  if (Test-Path $dir) { _ws-DoResumeOne $name } else { _ws-DoNewOne $name $base $prompt }
+}
+function _ws-RunAcross($name, $prompt, $repos) {
+  foreach ($r in $repos) {
+    $path = _ws-ResolveRepo $r
+    if (-not $path) { _ws-Err "── skip '$r': no such repo under $((_ws-CodeRoots) -join ';') (set WS_CODE_ROOT?)"; continue }
+    _ws-Say "── also: $(Split-Path $path -Leaf) ──"
+    Push-Location $path
+    try { _ws-DoEnsureOne $name '' $prompt } finally { Pop-Location }
+  }
+}
+function _ws-RunAcrossSplit($name, $prompt, $repos) {
+  if (-not $repos -or $repos.Count -eq 0) { return }
+  $flat = @()
+  foreach ($x in $repos) { $flat += ($x -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+  if ($flat.Count) { _ws-RunAcross $name $prompt $flat }
+}
+
+function _ws-New([string[]]$a) {
+  $name = ''; $base = ''; $prompt = ''; $repos = @(); $state = 'pos'
+  $i = 0
+  while ($i -lt $a.Count) {
+    $t = $a[$i]
+    if ($t -match '^(-a|--also)$') { $state = 'repos' }
+    elseif ($t -match '^(-p|--prompt)$') { $i++; $prompt = $a[$i]; $state = 'pos' }
+    elseif ($t -eq '--') { $i++; if ($i -lt $a.Count) { $prompt = ($a[$i..($a.Count - 1)] -join ' ') }; break }
+    elseif ($t -like '-*') { _ws-Err "ignoring unknown flag: $t" }
+    else {
+      if ($state -eq 'repos') { $repos += $t }
+      elseif (-not $name) { $name = $t } elseif (-not $base) { $base = $t }
+    }
+    $i++
+  }
+  if (-not $name) { _ws-Err "usage: ws new <name> [base] [-a repo,repo] [-- <prompt>]"; return }
+  if (-not (_ws-ValidName $name)) { _ws-Err "invalid name '$name' (no spaces, slashes, or leading dot)"; return }
+  if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
+  _ws-DoNewOne $name $base $prompt
+  _ws-RunAcrossSplit $name $prompt $repos
+}
+
+# `ws -a <repo>[,repo...]` — set up the SAME-named workspace (= current branch)
+# in the other repo(s) too.
+function _ws-Also([string[]]$a) {
+  if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
+  if (-not $a -or $a.Count -eq 0) { _ws-Err "usage: ws -a <repo>[,repo...]"; return }
+  $name = git rev-parse --abbrev-ref HEAD 2>$null
+  if (-not $name -or $name -eq 'HEAD') { _ws-Err "can't determine current branch"; return }
+  _ws-Say "using workspace name '$name' (current branch)"
+  _ws-RunAcrossSplit $name '' $a
+}
 
 function _ws-Resume([string[]]$a) {
   if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
-  $name = _ws-ResolveName $a[0]; if (-not $name) { return }
-  $dir = _ws-Dir $name
-  if (-not (Test-Path $dir)) { _ws-Err "no such workspace: $name"; return }
-  _ws-Mark $dir 'continue' ''
-  _ws-Open $dir $name
+  $name = ''; $repos = @(); $state = 'pos'
+  foreach ($t in $a) {
+    if ($t -match '^(-a|--also)$') { $state = 'repos' }
+    elseif ($t -like '-*') { _ws-Err "ignoring unknown flag: $t" }
+    else { if ($state -eq 'repos') { $repos += $t } elseif (-not $name) { $name = $t } }
+  }
+  $name = _ws-ResolveName $name; if (-not $name) { return }
+  _ws-DoResumeOne $name
+  _ws-RunAcrossSplit $name '' $repos
 }
 
 function _ws-Path([string[]]$a) {
@@ -292,6 +365,8 @@ ws v$script:WS_VERSION — per-branch worktree workspaces (open in your editor +
   ws -n <name> [base] [-- <prompt>]  new workspace; optional Claude starting prompt
   ws            (or ws -r)           resume: pick a workspace (fzf/menu) + open it
   ws -r <name>                       resume a specific one (Claude --continue)
+  ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
+  ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
   ws cd [name]                       cd this shell into a workspace
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -311,6 +386,7 @@ function ws {
   switch -Regex ($cmd) {
     '^(new|-n|--new)$'                 { _ws-New $rest; break }
     '^(resume|switch|-r|--resume)$'    { _ws-Resume $rest; break }
+    '^(-a|--also|also)$'               { _ws-Also $rest; break }
     '^cd$'                             { _ws-Cd $rest; break }
     '^(path|--print-dir)$'             { _ws-Path $rest; break }
     '^(ls|list|status|-l|--list)$'     { _ws-List; break }

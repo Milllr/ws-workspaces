@@ -4,6 +4,11 @@
 # Where worktrees live: $WS_HOME/<repo>/<workspace>
 # WS_HOME="$HOME/worktrees"
 
+# Where sibling repos live, for the -a (cross-repo) flag. Colon-separated on
+# Unix, semicolon-separated on Windows. Defaults to the parent directory of the
+# current repo's main checkout (e.g. ~/code if your repos are ~/code/*).
+# WS_CODE_ROOT="$HOME/code"
+
 # Gitignored files copied into each new worktree (space-separated).
 # Default seeds your env + Claude permissions so agents don't re-prompt.
 # WS_COPY=".env .claude/settings.local.json"

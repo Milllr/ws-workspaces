@@ -24,7 +24,7 @@ if ((Test-Path $__m) -and -not $env:WS_CLAUDE_STARTED) {
 # Tab-completion: subcommands + this repo's workspace names.
 Register-ArgumentCompleter -CommandName ws -ScriptBlock {
   param($word, $ast, $pos)
-  $subs = 'new', 'resume', 'switch', 'cd', 'ls', 'list', 'status', 'rm', 'remove', 'seed', 'docker', 'doctor', 'version', 'help'
+  $subs = 'new', 'resume', 'switch', 'also', 'cd', 'ls', 'list', 'status', 'rm', 'remove', 'seed', 'docker', 'doctor', 'version', 'help'
   $names = try { _ws-Names } catch { @() }
   ($subs + $names) | Where-Object { $_ -like "$word*" } |
     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }

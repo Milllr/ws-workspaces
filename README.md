@@ -8,6 +8,7 @@ switching, stashing, or agents clobbering each other.
 ws -n "bug-1203-blank-image"          # new branch+worktree, opens in your editor, Claude auto-starts
 ws -n hotfix -- "revert the bad migration and add a test"   # ...and hand Claude a starting task
 ws                                     # fuzzy/menu picker → resume a workspace (Claude --continue)
+ws -n auth-fix -a web-portal,gateway    # SAME branch+workspace across 3 repos (microservices)
 ws cd bug-1203                          # jump this shell into a workspace
 ws -l                                  # dashboard: branch · dirty? · ahead/behind · docker · age
 ws -rm bug-1203 -b                      # tear down (‑b also deletes the branch)
@@ -61,6 +62,8 @@ re-run it to upgrade. It:
 |---|---|
 | `ws -n <name> [base] [-- <prompt>]` | Create branch `<name>` + worktree, seed local files, open in editor, start Claude. `base` = ref to branch from (default `HEAD`). `-- <prompt>` (or `-p "<prompt>"`) hands Claude a starting task. If `<name>` is an existing local/remote branch, it's checked out instead of created. |
 | `ws` / `ws -r [name]` | Resume. No name → picker (fzf if installed, else numbered menu). Claude opens with `--continue`. |
+| `ws -n/-r <name> -a <repo,repo>` | Also open the **same-named** workspace in sibling repos (see Cross-repo below). |
+| `ws -a <repo,repo>` | From inside a workspace: set up the same workspace (= your current branch) in other repos too. |
 | `ws cd [name]` | `cd` the current shell into a workspace (needs the shell hook; installed by default). |
 | `ws -l` / `ws ls` / `ws status` | Dashboard: each workspace's branch, clean/dirty, ahead/behind upstream, docker-isolated?, last-commit age. |
 | `ws -rm [name] [-f] [-b]` | Remove the worktree. Warns on uncommitted/unpushed work; `-f` forces, `-b` also deletes the branch. |
@@ -71,6 +74,33 @@ re-run it to upgrade. It:
 
 Word forms and flags are interchangeable: `new`/`-n`, `resume`/`switch`/`-r`, `ls`/`list`/`status`/`-l`,
 `rm`/`remove`/`-rm`, `docker`/`-d`. Tab-completion covers subcommands and workspace names.
+
+---
+
+## Cross-repo workspaces (microservices)
+
+When a feature spans several repos, `-a` (also) fans the **same-named workspace** across them —
+one window, branch, worktree, and Claude session per repo:
+
+```
+# from api, spin up the SAME branch/workspace in three repos at once:
+ws -n auth-refresh -a web-portal,gateway
+#   → api/auth-refresh + web-portal/auth-refresh + gateway/auth-refresh
+
+# resume the whole set later:
+ws -r auth-refresh -a web-portal,gateway
+
+# already deep in a workspace and realise you also need another service?
+ws -a gateway            # uses your CURRENT branch name; sets you up in gateway too
+```
+
+- The primary repo (where you run it) does exactly what `-n`/`-r` says. Each `-a` repo is
+  **ensure-and-open**: resumes if that workspace already exists, otherwise creates it.
+- Sibling repos are found under `$WS_CODE_ROOT` (`;`-separated on Windows, `:` on Unix), defaulting
+  to the **parent of the current repo's main checkout** — so if your repos are `~/code/*`, just pass
+  names. You can also pass an explicit path (`-a ../other-repo`).
+- An unresolvable repo is skipped with a warning; the rest still run.
+- Repos are comma- and/or space-separated: `-a a,b`, `-a a b`, `-a "a", "b"` all work.
 
 ---
 
@@ -148,6 +178,7 @@ files. Precedence: env > config > defaults.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WS_HOME` | `~/worktrees` | Base dir; `$WS_HOME/<repo>/<name>`. |
+| `WS_CODE_ROOT` | parent of current repo | Where `-a` looks for sibling repos (`:`/`;`-separated). |
 | `WS_COPY` | `.env .claude/settings.local.json` | Space-separated gitignored files to seed. |
 | `~/.config/ws/seed/<repo>.txt` | — | Per-repo extra seed files, one path per line. |
 | `WS_EDITOR` | `auto` | `auto` (idea→code→cursor) / `idea` / `code` / `cursor` / `none` / any command. |

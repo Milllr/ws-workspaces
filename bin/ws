@@ -59,15 +59,37 @@ _ws_die()    { _ws_err "$*"; exit 1; }
 _ws_in_repo()      { git rev-parse --git-dir >/dev/null 2>&1; }
 _ws_require_repo() { _ws_in_repo || _ws_die "not inside a git repo"; }
 
-# name of the MAIN repo (works from the main checkout or any linked worktree)
-_ws_repo_name() {
-  local main
-  main="$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | head -1)"
-  [ -n "$main" ] || return 1
-  basename "$main"
-}
+# path/name of the MAIN checkout (works from the main checkout or any worktree)
+_ws_main_path() { git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | head -1; }
+_ws_repo_name() { local m; m="$(_ws_main_path)"; [ -n "$m" ] || return 1; basename "$m"; }
 _ws_base() { printf '%s/%s\n' "$WS_HOME" "$(_ws_repo_name)"; }
 _ws_dir()  { printf '%s/%s/%s\n' "$WS_HOME" "$(_ws_repo_name)" "$1"; }
+
+# Where sibling repos live (for -a): $WS_CODE_ROOT (colon-separated) or the parent
+# directory of the current repo's main checkout.
+_ws_code_roots() {
+  if [ -n "${WS_CODE_ROOT:-}" ]; then printf '%s\n' "$WS_CODE_ROOT" | tr ':' '\n'
+  else dirname "$(_ws_main_path)"; fi
+}
+# Resolve a repo name (or explicit path) to its main-checkout dir; prints or fails.
+_ws_resolve_repo() {
+  local nm="$1" cand root
+  case "$nm" in
+    /*|~*|./*|../*)
+      cand="${nm/#\~/$HOME}"
+      git -C "$cand" rev-parse --show-toplevel 2>/dev/null && return 0
+      return 1 ;;
+  esac
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    if git -C "$root/$nm" rev-parse --git-dir >/dev/null 2>&1; then
+      printf '%s\n' "$root/$nm"; return 0
+    fi
+  done <<EOF
+$(_ws_code_roots)
+EOF
+  return 1
+}
 
 _ws_valid_name() {
   case "$1" in
@@ -196,22 +218,11 @@ _ws_resolve_name() {
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
-_ws_cmd_new() {
-  local name="" base="" prompt=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -p|--prompt) shift; prompt="${1:-}" ;;
-      --)          shift; prompt="$*"; break ;;
-      -*)          _ws_err "ignoring unknown flag: $1" ;;
-      *)           if [ -z "$name" ]; then name="$1"; elif [ -z "$base" ]; then base="$1"; fi ;;
-    esac
-    shift
-  done
-  [ -n "$name" ] || _ws_die "usage: ws new <name> [base-ref] [-- <claude prompt>]"
-  _ws_valid_name "$name" || _ws_die "invalid name '$name' (no spaces, slashes, or leading dot)"
-  _ws_require_repo
-  local dir; dir="$(_ws_dir "$name")"
-  [ -e "$dir" ] && _ws_die "workspace exists: $dir  (resume: ws -r $name)"
+# --- per-repo primitives (assume CWD is inside the target repo) --------------
+_ws_do_new_one() {
+  local name="$1" base="$2" prompt="$3" dir
+  dir="$(_ws_dir "$name")"
+  [ -e "$dir" ] && { _ws_err "[$(_ws_repo_name)] workspace exists: $dir"; return 1; }
   mkdir -p "$(_ws_base)"
   if git show-ref --verify --quiet "refs/heads/$name"; then
     git worktree add "$dir" "$name" || return 1
@@ -226,14 +237,85 @@ _ws_cmd_new() {
   _ws_mark "$dir" "${prompt:+prompt}" "$prompt"
   _ws_open "$dir" "$name"
 }
+_ws_do_resume_one() {
+  local name="$1" dir
+  dir="$(_ws_dir "$name")"
+  [ -d "$dir" ] || { _ws_err "[$(_ws_repo_name)] no such workspace: $name"; return 1; }
+  _ws_mark "$dir" continue ""
+  _ws_open "$dir" "$name"
+}
+# ensure-and-open: resume if it exists, else create. Used for -a target repos.
+_ws_do_ensure_one() {
+  local name="$1" base="$2" prompt="$3" dir
+  dir="$(_ws_dir "$name")"
+  if [ -d "$dir" ]; then _ws_do_resume_one "$name"; else _ws_do_new_one "$name" "$base" "$prompt"; fi
+}
+
+# Run ensure-and-open for the same workspace name across sibling repos.
+_ws_run_across() {
+  local name="$1" prompt="$2"; shift 2
+  local r path
+  for r in "$@"; do
+    path="$(_ws_resolve_repo "$r")" || { _ws_err "── skip '$r': no such repo under $(_ws_code_roots | tr '\n' ':')  (set WS_CODE_ROOT?)"; continue; }
+    _ws_say "── also: $(basename "$path") ──"
+    ( cd "$path" && _ws_do_ensure_one "$name" "" "$prompt" )
+  done
+}
+# Split a raw "-a" token blob (space- and/or comma-separated) then fan out.
+_ws_run_across_split() {
+  local name="$1" prompt="$2" raw="$3"
+  [ -n "$raw" ] || return 0
+  local -a repos=(); local t
+  for t in ${raw//,/ }; do [ -n "$t" ] && repos+=("$t"); done
+  [ "${#repos[@]}" -gt 0 ] && _ws_run_across "$name" "$prompt" "${repos[@]}"
+}
+
+_ws_cmd_new() {
+  local name="" base="" prompt="" repos="" state=pos
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a|--also)   state=repos ;;
+      -p|--prompt) shift; prompt="${1:-}"; state=pos ;;
+      --)          shift; prompt="$*"; break ;;
+      -*)          _ws_err "ignoring unknown flag: $1" ;;
+      *) if [ "$state" = repos ]; then repos="$repos $1"
+         elif [ -z "$name" ]; then name="$1"; elif [ -z "$base" ]; then base="$1"; fi ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || _ws_die "usage: ws new <name> [base] [-a repo,repo] [-- <prompt>]"
+  _ws_valid_name "$name" || _ws_die "invalid name '$name' (no spaces, slashes, or leading dot)"
+  _ws_require_repo
+  _ws_do_new_one "$name" "$base" "$prompt"
+  _ws_run_across_split "$name" "$prompt" "$repos"
+}
+
+# `ws -a <repo>[,repo...]` from within a workspace: set up the SAME-named
+# workspace (= current branch) in the other repo(s) too.
+_ws_cmd_also() {
+  _ws_require_repo
+  local repos="$*"
+  [ -n "$repos" ] || _ws_die "usage: ws -a <repo>[,repo...]  (adds current workspace to other repos)"
+  local name; name="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [ -n "$name" ] && [ "$name" != HEAD ] || _ws_die "can't determine current branch (detached HEAD?)"
+  _ws_say "using workspace name '$name' (current branch)"
+  _ws_run_across_split "$name" "" "$repos"
+}
 
 _ws_cmd_resume() {
   _ws_require_repo
-  local name; name="$(_ws_resolve_name "${1:-}")" || return 1
-  local dir; dir="$(_ws_dir "$name")"
-  [ -d "$dir" ] || _ws_die "no such workspace: $name"
-  _ws_mark "$dir" continue ""
-  _ws_open "$dir" "$name"
+  local name="" repos="" state=pos
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a|--also) state=repos ;;
+      -*)        _ws_err "ignoring unknown flag: $1" ;;
+      *) if [ "$state" = repos ]; then repos="$repos $1"; elif [ -z "$name" ]; then name="$1"; fi ;;
+    esac
+    shift
+  done
+  name="$(_ws_resolve_name "$name")" || return 1
+  _ws_do_resume_one "$name"
+  _ws_run_across_split "$name" "" "$repos"
 }
 
 _ws_cmd_path() {
@@ -394,6 +476,8 @@ ws v$WS_VERSION — per-branch worktree workspaces (open in your editor + Claude
   ws -n <name> [base] [-- <prompt>]  new workspace; optional Claude starting prompt
   ws            (or ws -r)           resume: pick a workspace (fzf/menu) + open it
   ws -r <name>                       resume a specific one (Claude --continue)
+  ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
+  ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
   ws cd [name]                       cd this shell into a workspace (needs shell hook)
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -414,6 +498,7 @@ main() {
   case "$cmd" in
     new|-n|--new)                shift; _ws_cmd_new "$@" ;;
     resume|switch|-r|--resume)   shift; _ws_cmd_resume "$@" ;;
+    -a|--also|also)              shift; _ws_cmd_also "$@" ;;
     cd)                          shift; _ws_cmd_cd "$@" ;;
     path|--print-dir)            shift; _ws_cmd_path "$@" ;;
     ls|list|status|-l|--list)    shift; _ws_cmd_ls ;;
