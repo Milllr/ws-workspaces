@@ -40,7 +40,7 @@ _ws_autostart
 # Completion: subcommands + this repo's workspace names.
 _ws_zsh_complete() {
   local -a subs
-  subs=(new resume switch also cd path ls list status rm remove seed docker doctor version help)
+  subs=(new resume switch also update cd path ls list status rm remove seed docker doctor version help)
   (( CURRENT == 2 )) && compadd -- $subs
   compadd -- ${(f)"$("$_ws_bin" --list-names 2>/dev/null)"}
 }

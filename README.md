@@ -64,6 +64,7 @@ re-run it to upgrade. It:
 | `ws` / `ws -r [name]` | Resume. No name → picker (fzf if installed, else numbered menu). Claude opens with `--continue`. |
 | `ws -n/-r <name> -a <repo,repo>` | Also open the **same-named** workspace in sibling repos (see Cross-repo below). |
 | `ws -a <repo,repo>` | From inside a workspace: set up the same workspace (= your current branch) in other repos too. |
+| `ws -u [repo,repo]` | Fetch + rebase workspace(s) onto latest main. No repos → this workspace + all same-named siblings; with repos → just those. Skips dirty trees; aborts safely on conflict. |
 | `ws cd [name]` | `cd` the current shell into a workspace (needs the shell hook; installed by default). |
 | `ws -l` / `ws ls` / `ws status` | Dashboard: each workspace's branch, clean/dirty, ahead/behind upstream, docker-isolated?, last-commit age. |
 | `ws -rm [name] [-f] [-b]` | Remove the worktree. Warns on uncommitted/unpushed work; `-f` forces, `-b` also deletes the branch. |
@@ -101,6 +102,29 @@ ws -a gateway            # uses your CURRENT branch name; sets you up in gateway
   names. You can also pass an explicit path (`-a ../other-repo`).
 - An unresolvable repo is skipped with a warning; the rest still run.
 - Repos are comma- and/or space-separated: `-a a,b`, `-a a b`, `-a "a", "b"` all work.
+
+---
+
+## Keeping workspaces fresh (`-u`)
+
+Rebase a workspace (and its cross-repo siblings) onto the latest upstream default branch:
+
+```
+ws -u                    # this workspace + every same-named sibling → fetch + rebase onto origin/main
+ws -u web-portal         # just web-portal's same-named workspace
+```
+
+Per workspace it: refuses if the tree is dirty (commit/stash first), `git fetch origin`, then
+`git rebase origin/<default>` (default branch resolved from `origin/HEAD`, falling back to
+main/master). **On conflict it runs `git rebase --abort` and reports it** — it never leaves a repo
+in a half-rebased state, so a bulk `-u` across services can't strand you. Resolve the flagged one
+by hand.
+
+> **Publishing from a worktree is identical to the root checkout.** Worktrees share one `.git`
+> (objects, refs, remotes, config), so `git push -u origin <branch>`, fetch, and pull behave exactly
+> the same. The only worktree rules are that the same branch can't be checked out twice and
+> HEAD/index/stash are per-worktree — neither affects pushing. Note: after `-u` rebases a branch you
+> already pushed, its history is rewritten, so the next push needs `--force-with-lease`.
 
 ---
 

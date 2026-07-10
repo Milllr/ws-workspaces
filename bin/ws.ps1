@@ -213,6 +213,64 @@ function _ws-Also([string[]]$a) {
   _ws-RunAcrossSplit $name '' $a
 }
 
+# --- update: fetch + rebase onto latest default branch ----------------------
+function _ws-DefaultBranch($dir) {
+  $d = git -C $dir symbolic-ref --short refs/remotes/origin/HEAD 2>$null
+  if ($d) { return ($d -replace '^origin/', '') }
+  git -C $dir show-ref --verify --quiet refs/remotes/origin/main;   if ($LASTEXITCODE -eq 0) { return 'main' }
+  git -C $dir show-ref --verify --quiet refs/remotes/origin/master; if ($LASTEXITCODE -eq 0) { return 'master' }
+  return ''
+}
+function _ws-UpdateOne($dir) {
+  $label = Split-Path $dir -Leaf
+  $branch = git -C $dir rev-parse --abbrev-ref HEAD 2>$null
+  if (git -C $dir status --porcelain 2>$null) { _ws-Err "[$label] uncommitted changes — skipping (commit or stash first)"; return }
+  git -C $dir fetch --quiet --prune origin 2>$null
+  if ($LASTEXITCODE -ne 0) { _ws-Err "[$label] fetch failed"; return }
+  $def = _ws-DefaultBranch $dir
+  if (-not $def) { _ws-Err "[$label] can't determine default branch"; return }
+  git -C $dir rebase "origin/$def" *> $null
+  if ($LASTEXITCODE -eq 0) { _ws-Say "[$label] $branch rebased onto origin/$def" }
+  else { git -C $dir rebase --abort *> $null; _ws-Err "[$label] conflicts rebasing onto origin/$def — aborted; resolve manually: cd `"$dir`"; git rebase origin/$def" }
+}
+function _ws-DiscoverSame($name) {
+  $curname = Split-Path (_ws-MainPath) -Leaf
+  $out = @()
+  foreach ($root in (_ws-CodeRoots)) {
+    if (-not (Test-Path $root)) { continue }
+    foreach ($d in (Get-ChildItem -Directory $root -ErrorAction SilentlyContinue)) {
+      if ($d.Name -eq $curname) { continue }
+      git -C $d.FullName rev-parse --git-dir *> $null
+      if ($LASTEXITCODE -ne 0) { continue }
+      $wdir = Join-Path (Join-Path $env:WS_HOME $d.Name) $name
+      if (Test-Path $wdir) { $out += $wdir }
+    }
+  }
+  return $out
+}
+function _ws-Update([string[]]$a) {
+  if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
+  $name = git rev-parse --abbrev-ref HEAD 2>$null
+  if (-not $name -or $name -eq 'HEAD') { _ws-Err "can't determine current branch"; return }
+  $cur = git rev-parse --show-toplevel 2>$null
+  $targets = @()
+  if ($a -and $a.Count) {
+    $flat = @(); foreach ($x in $a) { $flat += ($x -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    foreach ($t in $flat) {
+      $path = _ws-ResolveRepo $t
+      if (-not $path) { _ws-Err "── skip '$t': no such repo"; continue }
+      $wdir = Join-Path (Join-Path $env:WS_HOME (Split-Path $path -Leaf)) $name
+      if (Test-Path $wdir) { $targets += $wdir } else { _ws-Err "── $(Split-Path $path -Leaf): no '$name' workspace — skipping" }
+    }
+  } else {
+    $targets += $cur
+    $targets += (_ws-DiscoverSame $name)
+  }
+  if (-not $targets.Count) { _ws-Say "no matching workspaces to update"; return }
+  _ws-Say "updating '$name' → fetch + rebase onto origin default"
+  foreach ($d in $targets) { _ws-UpdateOne $d }
+}
+
 function _ws-Resume([string[]]$a) {
   if (-not (_ws-InRepo)) { _ws-Err "not inside a git repo"; return }
   $name = ''; $repos = @(); $state = 'pos'
@@ -367,6 +425,7 @@ ws v$script:WS_VERSION — per-branch worktree workspaces (open in your editor +
   ws -r <name>                       resume a specific one (Claude --continue)
   ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
   ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
+  ws -u [repo,repo]                  fetch + rebase workspace(s) onto latest main (no repos = this + all same-named)
   ws cd [name]                       cd this shell into a workspace
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -387,6 +446,7 @@ function ws {
     '^(new|-n|--new)$'                 { _ws-New $rest; break }
     '^(resume|switch|-r|--resume)$'    { _ws-Resume $rest; break }
     '^(-a|--also|also)$'               { _ws-Also $rest; break }
+    '^(-u|--update|update)$'           { _ws-Update $rest; break }
     '^cd$'                             { _ws-Cd $rest; break }
     '^(path|--print-dir)$'             { _ws-Path $rest; break }
     '^(ls|list|status|-l|--list)$'     { _ws-List; break }

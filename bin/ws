@@ -302,6 +302,86 @@ _ws_cmd_also() {
   _ws_run_across_split "$name" "" "$repos"
 }
 
+# Default branch of a repo (origin/HEAD, else origin/main, else origin/master).
+_ws_default_branch() {
+  local dir="$1" d
+  d="$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"
+  d="${d#origin/}"
+  if [ -z "$d" ]; then
+    if git -C "$dir" show-ref --verify --quiet refs/remotes/origin/main; then d=main
+    elif git -C "$dir" show-ref --verify --quiet refs/remotes/origin/master; then d=master; fi
+  fi
+  printf '%s\n' "$d"
+}
+
+# fetch + rebase one worktree's branch onto the latest default branch. Safe:
+# skips a dirty tree, and aborts (never leaves a half-rebase) on conflict.
+_ws_update_one() {
+  local dir="$1" label branch def
+  label="$(basename "$dir")"
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+    _ws_err "[$label] uncommitted changes — skipping (commit or stash first)"; return 1
+  fi
+  git -C "$dir" fetch --quiet --prune origin 2>/dev/null || { _ws_err "[$label] fetch failed"; return 1; }
+  def="$(_ws_default_branch "$dir")"
+  [ -n "$def" ] || { _ws_err "[$label] can't determine default branch"; return 1; }
+  if git -C "$dir" rebase "origin/$def" >/dev/null 2>&1; then
+    _ws_say "[$label] $branch rebased onto origin/$def ✓"
+  else
+    git -C "$dir" rebase --abort >/dev/null 2>&1
+    _ws_err "[$label] conflicts rebasing onto origin/$def — aborted. Resolve manually: (cd \"$dir\" && git rebase origin/$def)"
+    return 1
+  fi
+}
+
+# Find same-named workspaces in OTHER sibling repos (under the code roots).
+_ws_discover_same() {
+  local name="$1" root d repo wdir curname
+  curname="$(basename "$(_ws_main_path)")"
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    for d in "$root"/*; do
+      [ -d "$d" ] || continue
+      repo="$(basename "$d")"
+      [ "$repo" = "$curname" ] && continue
+      git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || continue
+      wdir="$WS_HOME/$repo/$name"
+      [ -d "$wdir" ] && printf '%s\n' "$wdir"
+    done
+  done <<EOF
+$(_ws_code_roots)
+EOF
+}
+
+_ws_cmd_update() {
+  _ws_require_repo
+  local repos_raw="$*"
+  local name; name="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [ -n "$name" ] && [ "$name" != HEAD ] || _ws_die "can't determine current branch (detached HEAD?)"
+  local cur; cur="$(git rev-parse --show-toplevel 2>/dev/null)"
+  local -a targets=()
+  if [ -n "$repos_raw" ]; then
+    local t path repo wdir
+    for t in ${repos_raw//,/ }; do
+      [ -n "$t" ] || continue
+      path="$(_ws_resolve_repo "$t")" || { _ws_err "── skip '$t': no such repo"; continue; }
+      repo="$(basename "$path")"; wdir="$WS_HOME/$repo/$name"
+      if [ -d "$wdir" ]; then targets+=("$wdir"); else _ws_err "── $repo: no '$name' workspace — skipping"; fi
+    done
+  else
+    targets+=("$cur")
+    local wdir
+    while IFS= read -r wdir; do [ -n "$wdir" ] && targets+=("$wdir"); done <<EOF
+$(_ws_discover_same "$name")
+EOF
+  fi
+  [ "${#targets[@]}" -gt 0 ] || { _ws_say "no matching workspaces to update"; return 0; }
+  _ws_say "updating '$name' → fetch + rebase onto origin default"
+  local d
+  for d in "${targets[@]}"; do _ws_update_one "$d"; done
+}
+
 _ws_cmd_resume() {
   _ws_require_repo
   local name="" repos="" state=pos
@@ -478,6 +558,7 @@ ws v$WS_VERSION — per-branch worktree workspaces (open in your editor + Claude
   ws -r <name>                       resume a specific one (Claude --continue)
   ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
   ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
+  ws -u [repo,repo]                  fetch + rebase workspace(s) onto latest main (no repos = this + all same-named)
   ws cd [name]                       cd this shell into a workspace (needs shell hook)
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -499,6 +580,7 @@ main() {
     new|-n|--new)                shift; _ws_cmd_new "$@" ;;
     resume|switch|-r|--resume)   shift; _ws_cmd_resume "$@" ;;
     -a|--also|also)              shift; _ws_cmd_also "$@" ;;
+    -u|--update|update)          shift; _ws_cmd_update "$@" ;;
     cd)                          shift; _ws_cmd_cd "$@" ;;
     path|--print-dir)            shift; _ws_cmd_path "$@" ;;
     ls|list|status|-l|--list)    shift; _ws_cmd_ls ;;

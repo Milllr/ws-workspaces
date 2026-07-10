@@ -33,7 +33,7 @@ _ws_autostart
 
 _ws_bash_complete() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local subs="new resume switch also cd path ls list status rm remove seed docker doctor version help"
+  local subs="new resume switch also update cd path ls list status rm remove seed docker doctor version help"
   local names; names="$("$_ws_bin" --list-names 2>/dev/null)"
   COMPREPLY=( $(compgen -W "$subs $names" -- "$cur") )
 }
