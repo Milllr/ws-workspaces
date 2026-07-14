@@ -42,9 +42,12 @@ WS_CONFIG_DIR="${WS_CONFIG_DIR:-$HOME/.config/ws}"
 [ -f "$WS_CONFIG_DIR/config" ] && . "$WS_CONFIG_DIR/config"
 : "${WS_HOME:=$HOME/worktrees}"
 # Seeded into each new worktree (gitignored local files a fresh checkout lacks).
-# .claude/settings.local.json carries your approved Claude permissions across
-# workspaces so Claude doesn't re-prompt in every one.
-: "${WS_COPY:=.env .claude/settings.local.json}"
+# Space-separated glob patterns (relative to the repo root). Default grabs every
+# local dotenv file (.env, .env.local, .env.development, …) — committed ones like
+# .env.example/.env.production already exist in the checkout and are skipped — plus
+# .claude/settings.local.json, which carries your approved Claude permissions so
+# Claude doesn't re-prompt in each workspace.
+: "${WS_COPY:=.env* .claude/settings.local.json}"
 : "${WS_EDITOR:=auto}"
 : "${WS_IDEA_WAIT:=15}"
 
@@ -109,22 +112,28 @@ _ws_names() {           # one workspace name per line for the current repo
 # seeding + marker
 # --------------------------------------------------------------------------- #
 _ws_seed() {
-  local dir="$1" root repo f line seedlist
+  local dir="$1" root repo pat line seedlist src rel
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
   repo="$(_ws_repo_name)"
-  local -a files=()
-  for f in $WS_COPY; do files+=("$f"); done
+  local -a pats=()
+  read -ra pats <<< "$WS_COPY"                       # split without globbing
   seedlist="$WS_CONFIG_DIR/seed/$repo.txt"
   if [ -f "$seedlist" ]; then
-    while IFS= read -r line; do [ -n "$line" ] && files+=("$line"); done < "$seedlist"
+    while IFS= read -r line; do [ -n "$line" ] && pats+=("$line"); done < "$seedlist"
   fi
-  for f in "${files[@]}"; do
-    [ -n "$f" ] || continue
-    if [ -e "$root/$f" ] && [ ! -e "$dir/$f" ]; then
-      mkdir -p "$dir/$(dirname "$f")" 2>/dev/null
-      cp -R "$root/$f" "$dir/$f" 2>/dev/null && _ws_say "seeded $f"
-    fi
+  local had_nullglob=1; shopt -q nullglob || had_nullglob=0
+  shopt -s nullglob
+  for pat in "${pats[@]}"; do
+    [ -n "$pat" ] || continue
+    for src in "$root"/$pat; do                       # glob patterns against the repo root
+      [ -e "$src" ] || continue
+      rel="${src#"$root"/}"
+      [ -e "$dir/$rel" ] && continue                  # never overwrite (committed files already there)
+      mkdir -p "$dir/$(dirname "$rel")" 2>/dev/null
+      cp -R "$src" "$dir/$rel" 2>/dev/null && _ws_say "seeded $rel"
+    done
   done
+  [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
 }
 
 # Marker read by the shell hook: a QUEUE of launch specs, one per line. Each new

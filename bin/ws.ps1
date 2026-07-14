@@ -13,7 +13,7 @@ $__cfg = Join-Path $script:WS_DIR 'config.ps1'
 if (Test-Path $__cfg) { . $__cfg }
 if (-not $env:WS_HOME)   { $env:WS_HOME   = Join-Path $HOME 'worktrees' }
 # .claude/settings.local.json carries approved Claude permissions into each workspace.
-if (-not $env:WS_COPY)   { $env:WS_COPY   = '.env .claude/settings.local.json' }
+if (-not $env:WS_COPY)   { $env:WS_COPY   = '.env* .claude/settings.local.json' }
 if (-not $env:WS_EDITOR) { $env:WS_EDITOR = 'auto' }
 
 # ---- helpers ----------------------------------------------------------------
@@ -71,16 +71,25 @@ function _ws-Names {
 function _ws-Seed($dir) {
   $root = git rev-parse --show-toplevel 2>$null
   if (-not $root) { return }
-  $files = @($env:WS_COPY -split '\s+' | Where-Object { $_ })
+  $pats = @($env:WS_COPY -split '\s+' | Where-Object { $_ })
   $seedList = Join-Path $script:WS_DIR ("seed\" + (_ws-RepoName) + ".txt")
-  if (Test-Path $seedList) { $files += @(Get-Content $seedList | Where-Object { $_.Trim() }) }
-  foreach ($f in $files) {
-    $src = Join-Path $root $f
-    $dst = Join-Path $dir $f
-    if ((Test-Path $src) -and -not (Test-Path $dst)) {
-      New-Item -ItemType Directory -Force -Path (Split-Path $dst) *> $null
-      Copy-Item -Recurse -Force $src $dst
-      _ws-Say "seeded $f"
+  if (Test-Path $seedList) { $pats += @(Get-Content $seedList | Where-Object { $_.Trim() }) }
+  foreach ($pat in $pats) {
+    $srcs = @()
+    if ($pat -match '[*?]') {
+      $srcs = @(Get-ChildItem -Path (Join-Path $root $pat) -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    } else {
+      $p = Join-Path $root $pat
+      if (Test-Path $p) { $srcs = @($p) }
+    }
+    foreach ($src in $srcs) {
+      $rel = $src.Substring($root.Length).TrimStart('\', '/')
+      $dst = Join-Path $dir $rel
+      if (-not (Test-Path $dst)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst) *> $null
+        Copy-Item -Recurse -Force $src $dst
+        _ws-Say "seeded $rel"
+      }
     }
   }
 }

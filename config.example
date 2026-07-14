@@ -9,9 +9,11 @@
 # current repo's main checkout (e.g. ~/code if your repos are ~/code/*).
 # WS_CODE_ROOT="$HOME/code"
 
-# Gitignored files copied into each new worktree (space-separated).
-# Default seeds your env + Claude permissions so agents don't re-prompt.
-# WS_COPY=".env .claude/settings.local.json"
+# Files copied into each new worktree — space-separated glob patterns, relative to
+# the repo root. Default grabs every local dotenv file (.env, .env.local,
+# .env.development, ...) plus Claude permissions. Committed files already in the
+# checkout are skipped, so patterns like .env* are safe.
+# WS_COPY=".env* .claude/settings.local.json"
 
 # Editor to open workspaces in: auto | idea | code | cursor | none | <any command>
 # 'auto' prefers idea, then code, then cursor.

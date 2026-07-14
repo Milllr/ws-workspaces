@@ -187,7 +187,7 @@ per-repo files, no daemon.
    same from the main checkout or any worktree. Workspaces live at `$WS_HOME/<repo>/<name>` (default
    `~/worktrees/<repo>/<name>`); `<name>` is the branch, the folder, and the editor project title.
 2. **Create.** Picks the right `git worktree add` form (new branch / existing local / tracked remote).
-3. **Seed.** Copies `WS_COPY` (default `.env` + `.claude/settings.local.json`) plus anything in
+3. **Seed.** Copies `WS_COPY` (default `.env*` — every local dotenv — + `.claude/settings.local.json`) plus anything in
    `~/.config/ws/seed/<repo>.txt` from the checkout you ran `ws` in. Nested paths handled; existing
    files never overwritten.
 4. **Marker + hook.** `ws` writes `.ws-autoclaude` (line 1 = mode `fresh`/`continue`/`prompt`, rest =
@@ -236,7 +236,7 @@ files. Precedence: env > config > defaults.
 |---|---|---|
 | `WS_HOME` | `~/worktrees` | Base dir; `$WS_HOME/<repo>/<name>`. |
 | `WS_CODE_ROOT` | parent of current repo | Where `-a` looks for sibling repos (`:`/`;`-separated). |
-| `WS_COPY` | `.env .claude/settings.local.json` | Space-separated gitignored files to seed. |
+| `WS_COPY` | `.env* .claude/settings.local.json` | Space-separated glob patterns (rel. to repo root) to seed. `.env*` covers `.env`, `.env.local`, `.env.development`, … (committed files already present are skipped). |
 | `~/.config/ws/seed/<repo>.txt` | — | Per-repo extra seed files, one path per line. |
 | `WS_EDITOR` | `auto` | `auto` (idea→code→cursor) / `idea` / `code` / `cursor` / `none` / any command. |
 | `WS_IDEA_WAIT` | `15` | macOS: seconds to wait for the IntelliJ window. |
