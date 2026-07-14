@@ -85,11 +85,9 @@ function _ws-Seed($dir) {
   }
 }
 
-function _ws-Mark($dir, $mode, $payload) {
-  $content = "$mode`n"
-  if ($payload) { $content += $payload }
-  [IO.File]::WriteAllText((Join-Path $dir '.ws-autoclaude'), $content)
-}
+# Marker = a QUEUE of launch specs, one per line (fresh|continue|resume <uuid>|prompt <text>).
+function _ws-Mark($dir, $spec) { [IO.File]::WriteAllText((Join-Path $dir '.ws-autoclaude'), "$spec`n") }
+function _ws-MarkQueue($dir, $specs) { [IO.File]::WriteAllText((Join-Path $dir '.ws-autoclaude'), (($specs -join "`n") + "`n")) }
 
 function _ws-ResolveEditor {
   switch ($env:WS_EDITOR) {
@@ -151,13 +149,13 @@ function _ws-DoNewOne($name, $base, $prompt) {
   }
   if ($LASTEXITCODE -ne 0) { return }
   _ws-Seed $dir
-  if ($prompt) { _ws-Mark $dir 'prompt' $prompt } else { _ws-Mark $dir '' '' }
+  if ($prompt) { _ws-Mark $dir "prompt $prompt" } else { _ws-Mark $dir 'fresh' }
   _ws-Open $dir $name
 }
 function _ws-DoResumeOne($name) {
   $dir = _ws-Dir $name
   if (-not (Test-Path $dir)) { _ws-Err "[$(_ws-RepoName)] no such workspace: $name"; return }
-  _ws-Mark $dir 'continue' ''
+  _ws-Mark $dir 'continue'
   _ws-Open $dir $name
 }
 function _ws-DoEnsureOne($name, $base, $prompt) {
@@ -269,6 +267,67 @@ function _ws-Update([string[]]$a) {
   if (-not $targets.Count) { _ws-Say "no matching workspaces to update"; return }
   _ws-Say "updating '$name' → fetch + rebase onto origin default"
   foreach ($d in $targets) { _ws-UpdateOne $d }
+}
+
+# --- session save/restore ----------------------------------------------------
+# NOTE: Claude session slug encoding on Windows is best-effort; verify on Windows.
+function _ws-IjConfigDir {
+  $base = Join-Path $env:APPDATA 'JetBrains'
+  if (-not (Test-Path $base)) { return $null }
+  Get-ChildItem -Directory $base -Filter 'IntelliJIdea*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName
+}
+function _ws-OpenProjects($rp) {
+  $out = @(); $k = ''
+  foreach ($line in (Get-Content $rp)) {
+    $m = [regex]::Match($line, 'key="([^"]*)"'); if ($m.Success) { $k = $m.Groups[1].Value }
+    if ($line -match 'opened="true"' -and $k) { $out += ($k -replace '\$USER_HOME\$', ($HOME -replace '\\', '/')); $k = '' }
+  }
+  return $out
+}
+function _ws-RecentSessions($path) {
+  $slug = $path -replace '[\\/]', '-'
+  $dir = Join-Path (Join-Path $HOME '.claude\projects') $slug
+  if (-not (Test-Path $dir)) { return @() }
+  $mins = if ($env:WS_ACTIVE_WINDOW) { [int]$env:WS_ACTIVE_WINDOW * 60 } else { 1080 }
+  $max  = if ($env:WS_MAX_SESSIONS) { [int]$env:WS_MAX_SESSIONS } else { 4 }
+  $cut = (Get-Date).AddMinutes(-$mins)
+  Get-ChildItem $dir -Filter '*.jsonl' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $cut } | Sort-Object LastWriteTime -Descending | Select-Object -First $max | ForEach-Object { $_.BaseName }
+}
+function _ws-ArmClaude($path) {
+  $s = @(_ws-RecentSessions $path)
+  if (-not $s.Count) { return $false }
+  _ws-MarkQueue $path ($s | ForEach-Object { "resume $_" })
+  return $true
+}
+function _ws-Save([string[]]$a) {
+  $name = if ($a -and $a[0]) { $a[0] } else { 'last' }
+  $cfg = _ws-IjConfigDir; if (-not $cfg) { _ws-Err "can't find IntelliJ config dir"; return }
+  $rp = Join-Path $cfg 'options\recentProjects.xml'
+  if (-not (Test-Path $rp)) { _ws-Err "can't find recentProjects.xml"; return }
+  $dir = Join-Path $script:WS_DIR 'sessions'; New-Item -ItemType Directory -Force -Path $dir *> $null
+  $sf = Join-Path $dir $name
+  $paths = @(_ws-OpenProjects $rp | Where-Object { Test-Path $_ })
+  Set-Content -Path $sf -Value $paths
+  $armed = 0; foreach ($p in $paths) { if (_ws-ArmClaude $p) { $armed++ } }
+  _ws-Say "saved '$name': $($paths.Count) project(s), Claude armed in $armed → $sf"
+  _ws-Say "enable IntelliJ 'Reopen projects on startup' so relaunch restores windows+terminals; or: ws restore $name"
+}
+function _ws-Restore([string[]]$a) {
+  $name = if ($a -and $a[0]) { $a[0] } else { 'last' }
+  $sf = Join-Path (Join-Path $script:WS_DIR 'sessions') $name
+  if (-not (Test-Path $sf)) { _ws-Err "no saved session '$name' — create with: ws save"; return }
+  $ed = _ws-ResolveEditor
+  foreach ($p in (Get-Content $sf)) {
+    if (-not $p -or -not (Test-Path $p)) { continue }
+    if (-not (Test-Path (Join-Path $p '.ws-autoclaude'))) { _ws-ArmClaude $p | Out-Null }
+    _ws-Say "restore [$(Split-Path $p -Leaf)]"
+    if ($ed -ne 'none') { $c = Get-Command $ed -ErrorAction SilentlyContinue; if ($c) { & $c.Source $p } }
+  }
+}
+function _ws-Sessions {
+  $dir = Join-Path $script:WS_DIR 'sessions'
+  if (-not (Test-Path $dir) -or -not (Get-ChildItem $dir -ErrorAction SilentlyContinue)) { _ws-Say "no saved sessions (create one: ws save)"; return }
+  Get-ChildItem $dir | ForEach-Object { Write-Host ("  {0,-16} {1} project(s)" -f $_.Name, (@(Get-Content $_.FullName | Where-Object { $_ })).Count) }
 }
 
 function _ws-Resume([string[]]$a) {
@@ -426,6 +485,9 @@ ws v$script:WS_VERSION — per-branch worktree workspaces (open in your editor +
   ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
   ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
   ws -u [repo,repo]                  fetch + rebase workspace(s) onto latest main (no repos = this + all same-named)
+  ws save [session]                  snapshot open IntelliJ projects + arm Claude resume (default: 'last')
+  ws restore [session]               reopen a saved session's windows (Claude resumes in each)
+  ws sessions                        list saved sessions
   ws cd [name]                       cd this shell into a workspace
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -447,6 +509,9 @@ function ws {
     '^(resume|switch|-r|--resume)$'    { _ws-Resume $rest; break }
     '^(-a|--also|also)$'               { _ws-Also $rest; break }
     '^(-u|--update|update)$'           { _ws-Update $rest; break }
+    '^save$'                           { _ws-Save $rest; break }
+    '^restore$'                        { _ws-Restore $rest; break }
+    '^sessions$'                       { _ws-Sessions; break }
     '^cd$'                             { _ws-Cd $rest; break }
     '^(path|--print-dir)$'             { _ws-Path $rest; break }
     '^(ls|list|status|-l|--list)$'     { _ws-List; break }

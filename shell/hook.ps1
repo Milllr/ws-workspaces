@@ -3,20 +3,29 @@
 
 . "$HOME\.config\ws\ws.ps1"
 
-# Auto-start Claude the first time a shell opens in a workspace (one-shot marker:
-# line 1 = mode fresh|continue|prompt, remaining lines = prompt payload).
+# Auto-start Claude in a workspace terminal. The marker is a QUEUE (one launch
+# spec per line: fresh|continue|resume <uuid>|prompt <text>); each new terminal
+# pops the first line, so N terminals resume N Claude sessions.
 $__m = Join-Path (Get-Location) '.ws-autoclaude'
 if ((Test-Path $__m) -and -not $env:WS_CLAUDE_STARTED) {
-  $env:WS_CLAUDE_STARTED = '1'
-  $__lines = @(Get-Content $__m -ErrorAction SilentlyContinue)
-  Remove-Item -Force $__m -ErrorAction SilentlyContinue
-  $__mode = if ($__lines.Count -ge 1) { $__lines[0] } else { '' }
-  $__payload = if ($__lines.Count -ge 2) { ($__lines[1..($__lines.Count - 1)] -join "`n") } else { '' }
-  if (Get-Command claude -ErrorAction SilentlyContinue) {
-    switch ($__mode) {
-      'continue' { claude --continue }
-      'prompt'   { claude $__payload }
-      default    { claude }
+  $__ttl = if ($env:WS_MARKER_TTL) { [int]$env:WS_MARKER_TTL } else { 1440 }
+  if (((Get-Date) - (Get-Item $__m).LastWriteTime).TotalMinutes -gt $__ttl) {
+    Remove-Item -Force $__m -ErrorAction SilentlyContinue
+  } else {
+    $env:WS_CLAUDE_STARTED = '1'
+    $__lines = @(Get-Content $__m -ErrorAction SilentlyContinue)
+    $__spec = if ($__lines.Count -ge 1) { $__lines[0] } else { '' }
+    if ($__lines.Count -ge 2) { Set-Content -Path $__m -Value ($__lines[1..($__lines.Count - 1)]) }
+    else { Remove-Item -Force $__m -ErrorAction SilentlyContinue }
+    if (Get-Command claude -ErrorAction SilentlyContinue) {
+      $__mode = ($__spec -split ' ', 2)[0]
+      $__payload = if ($__spec -match ' ') { ($__spec -split ' ', 2)[1] } else { '' }
+      switch ($__mode) {
+        'continue' { claude --continue }
+        'resume'   { claude --resume $__payload }
+        'prompt'   { claude $__payload }
+        default    { claude }
+      }
     }
   }
 }
@@ -24,7 +33,7 @@ if ((Test-Path $__m) -and -not $env:WS_CLAUDE_STARTED) {
 # Tab-completion: subcommands + this repo's workspace names.
 Register-ArgumentCompleter -CommandName ws -ScriptBlock {
   param($word, $ast, $pos)
-  $subs = 'new', 'resume', 'switch', 'also', 'update', 'cd', 'ls', 'list', 'status', 'rm', 'remove', 'seed', 'docker', 'doctor', 'version', 'help'
+  $subs = 'new', 'resume', 'switch', 'also', 'update', 'save', 'restore', 'sessions', 'cd', 'ls', 'list', 'status', 'rm', 'remove', 'seed', 'docker', 'doctor', 'version', 'help'
   $names = try { _ws-Names } catch { @() }
   ($subs + $names) | Where-Object { $_ -like "$word*" } |
     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }

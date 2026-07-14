@@ -127,10 +127,15 @@ _ws_seed() {
   done
 }
 
-# One-shot marker read by the shell hook. mode: fresh|continue|prompt
-_ws_mark() {
-  local dir="$1" mode="$2" payload="${3:-}"
-  { printf '%s\n' "$mode"; [ -n "$payload" ] && printf '%s' "$payload"; } > "$dir/.ws-autoclaude"
+# Marker read by the shell hook: a QUEUE of launch specs, one per line. Each new
+# terminal in the worktree pops the first line. Specs: "fresh" | "continue" |
+# "resume <uuid>" | "prompt <text>". One spec:
+_ws_mark() { printf '%s\n' "$2" > "$1/.ws-autoclaude"; }
+# Multiple specs (e.g. one Claude session per line, for session restore):
+_ws_mark_queue() {
+  local d="$1"; shift
+  : > "$d/.ws-autoclaude"
+  local s; for s in "$@"; do printf '%s\n' "$s" >> "$d/.ws-autoclaude"; done
 }
 
 # --------------------------------------------------------------------------- #
@@ -234,14 +239,14 @@ _ws_do_new_one() {
     git worktree add -b "$name" "$dir" || return 1
   fi
   _ws_seed "$dir"
-  _ws_mark "$dir" "${prompt:+prompt}" "$prompt"
+  if [ -n "$prompt" ]; then _ws_mark "$dir" "prompt $prompt"; else _ws_mark "$dir" fresh; fi
   _ws_open "$dir" "$name"
 }
 _ws_do_resume_one() {
   local name="$1" dir
   dir="$(_ws_dir "$name")"
   [ -d "$dir" ] || { _ws_err "[$(_ws_repo_name)] no such workspace: $name"; return 1; }
-  _ws_mark "$dir" continue ""
+  _ws_mark "$dir" continue
   _ws_open "$dir" "$name"
 }
 # ensure-and-open: resume if it exists, else create. Used for -a target repos.
@@ -380,6 +385,95 @@ EOF
   _ws_say "updating '$name' → fetch + rebase onto origin default"
   local d
   for d in "${targets[@]}"; do _ws_update_one "$d"; done
+}
+
+# --- session save/restore ---------------------------------------------------
+# IntelliJ config dir (latest), macOS or Linux.
+_ws_ij_config_dir() {
+  local d
+  for d in "$HOME/Library/Application Support/JetBrains/IntelliJIdea"* "$HOME/.config/JetBrains/IntelliJIdea"*; do
+    [ -d "$d" ] && printf '%s\n' "$d"
+  done | sort | tail -1
+}
+# Open project paths from recentProjects.xml (opened="true"), $USER_HOME$ expanded.
+_ws_open_projects() {
+  awk -v home="$HOME" '
+    match($0, /key="[^"]*"/) { k = substr($0, RSTART+5, RLENGTH-6) }
+    /opened="true"/ { if (k != "") { gsub(/\$USER_HOME\$/, home, k); print k; k="" } }
+  ' "$1"
+}
+_ws_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# Claude session UUIDs for a project path, recently active first, capped.
+_ws_recent_sessions() {
+  local path="$1" slug dir mins max f
+  slug="$(printf '%s' "$path" | sed 's#/#-#g')"
+  dir="$HOME/.claude/projects/$slug"
+  [ -d "$dir" ] || return 0
+  mins=$(( ${WS_ACTIVE_WINDOW:-18} * 60 )); max=${WS_MAX_SESSIONS:-4}
+  find "$dir" -maxdepth 1 -name '*.jsonl' -type f -mmin "-$mins" 2>/dev/null \
+    | while IFS= read -r f; do printf '%s\t%s\n' "$(_ws_mtime "$f")" "$(basename "$f" .jsonl)"; done \
+    | sort -rn | head -n "$max" | cut -f2-
+}
+# Arm a workspace so its restored terminals resume Claude. Returns 0 if armed.
+_ws_arm_claude() {
+  local path="$1"; local -a specs=(); local u
+  while IFS= read -r u; do [ -n "$u" ] && specs+=("resume $u"); done <<EOF
+$(_ws_recent_sessions "$path")
+EOF
+  [ "${#specs[@]}" -gt 0 ] || return 1
+  _ws_mark_queue "$path" "${specs[@]}"
+  return 0
+}
+
+_ws_cmd_save() {
+  local name="${1:-last}"
+  local cfg rp; cfg="$(_ws_ij_config_dir)"; rp="$cfg/options/recentProjects.xml"
+  [ -f "$rp" ] || _ws_die "can't find IntelliJ recentProjects.xml (looked in $cfg/options/)"
+  mkdir -p "$WS_CONFIG_DIR/sessions"
+  local sf="$WS_CONFIG_DIR/sessions/$name"; : > "$sf"
+  local path count=0 armed=0 nses
+  while IFS= read -r path; do
+    [ -n "$path" ] && [ -d "$path" ] || continue
+    printf '%s\n' "$path" >> "$sf"; count=$((count+1))
+    if _ws_arm_claude "$path"; then
+      nses="$(grep -c . "$path/.ws-autoclaude" 2>/dev/null)"
+      armed=$((armed+1)); _ws_say "  armed $(basename "$path") ($nses Claude session(s))"
+    fi
+  done <<EOF
+$(_ws_open_projects "$rp")
+EOF
+  _ws_say "saved '$name': $count open project(s), Claude armed in $armed → $sf"
+  _ws_say "restart-safe: enable IntelliJ 'Reopen projects on startup' + terminal restore, then"
+  _ws_say "relaunching IntelliJ reopens windows/terminals and resumes Claude. Or run: ws restore $name"
+}
+
+_ws_cmd_restore() {
+  local name="${1:-last}"
+  local sf="$WS_CONFIG_DIR/sessions/$name"
+  [ -f "$sf" ] || _ws_die "no saved session '$name' — create one with: ws save"
+  local applescript ed path label n=0
+  applescript="$(_ws_asset idea_open.applescript)"
+  ed="$(_ws_resolve_editor)"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    [ -d "$path" ] || { _ws_err "skip (gone): $path"; continue; }
+    label="$(basename "$path")"; n=$((n+1))
+    [ -f "$path/.ws-autoclaude" ] || _ws_arm_claude "$path" || true
+    _ws_say "restore [$label]"
+    if [ "$ed" = none ] || ! command -v "$ed" >/dev/null 2>&1; then continue; fi
+    "$ed" "$path" >/dev/null 2>&1 || true
+    if [ "$ed" = idea ] && _ws_is_mac && [ -z "${WS_NO_UI:-}" ] && [ -n "$applescript" ]; then
+      osascript "$applescript" "$label" 1 1 "$WS_IDEA_WAIT" >/dev/null 2>&1 || true
+    fi
+  done < "$sf"
+  _ws_say "restored $n project(s) from '$name'"
+}
+
+_ws_cmd_sessions() {
+  local d="$WS_CONFIG_DIR/sessions"
+  [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ] || { _ws_say "no saved sessions (create one: ws save)"; return 0; }
+  local f
+  for f in "$d"/*; do printf '  %-16s %s project(s)\n' "$(basename "$f")" "$(grep -c . "$f")"; done
 }
 
 _ws_cmd_resume() {
@@ -559,6 +653,9 @@ ws v$WS_VERSION — per-branch worktree workspaces (open in your editor + Claude
   ws -n/-r <name> -a <repo,repo>     also open the same-named workspace in sibling repos
   ws -a <repo,repo>                  set up your CURRENT workspace in other repos too
   ws -u [repo,repo]                  fetch + rebase workspace(s) onto latest main (no repos = this + all same-named)
+  ws save [session]                  snapshot open IntelliJ projects + arm Claude resume (default: 'last')
+  ws restore [session]               reopen a saved session's windows (Claude resumes in each)
+  ws sessions                        list saved sessions
   ws cd [name]                       cd this shell into a workspace (needs shell hook)
   ws -l         (ls|status)          list workspaces with branch/dirty/ahead-behind
   ws -rm [name] [-f] [-b]            remove (-f force, -b also delete branch)
@@ -581,6 +678,9 @@ main() {
     resume|switch|-r|--resume)   shift; _ws_cmd_resume "$@" ;;
     -a|--also|also)              shift; _ws_cmd_also "$@" ;;
     -u|--update|update)          shift; _ws_cmd_update "$@" ;;
+    save)                        shift; _ws_cmd_save "$@" ;;
+    restore)                     shift; _ws_cmd_restore "$@" ;;
+    sessions)                    shift; _ws_cmd_sessions ;;
     cd)                          shift; _ws_cmd_cd "$@" ;;
     path|--print-dir)            shift; _ws_cmd_path "$@" ;;
     ls|list|status|-l|--list)    shift; _ws_cmd_ls ;;

@@ -65,6 +65,9 @@ re-run it to upgrade. It:
 | `ws -n/-r <name> -a <repo,repo>` | Also open the **same-named** workspace in sibling repos (see Cross-repo below). |
 | `ws -a <repo,repo>` | From inside a workspace: set up the same workspace (= your current branch) in other repos too. |
 | `ws -u [repo,repo]` | Fetch + rebase workspace(s) onto latest main. No repos → this workspace + all same-named siblings; with repos → just those. Skips dirty trees; aborts safely on conflict. |
+| `ws save [session]` | Snapshot the open IntelliJ projects and arm Claude-session resume in each (default session name `last`). See Save & restore below. |
+| `ws restore [session]` | Reopen a saved session's windows; each terminal resumes its Claude session. |
+| `ws sessions` | List saved sessions. |
 | `ws cd [name]` | `cd` the current shell into a workspace (needs the shell hook; installed by default). |
 | `ws -l` / `ws ls` / `ws status` | Dashboard: each workspace's branch, clean/dirty, ahead/behind upstream, docker-isolated?, last-commit age. |
 | `ws -rm [name] [-f] [-b]` | Remove the worktree. Warns on uncommitted/unpushed work; `-f` forces, `-b` also deletes the branch. |
@@ -102,6 +105,36 @@ ws -a gateway            # uses your CURRENT branch name; sets you up in gateway
   names. You can also pass an explicit path (`-a ../other-repo`).
 - An unresolvable repo is skipped with a warning; the rest still run.
 - Repos are comma- and/or space-separated: `-a a,b`, `-a a b`, `-a "a", "b"` all work.
+
+---
+
+## Save & restore your session (survive a reboot)
+
+Bring back all your open project windows, their terminals, and the Claude sessions running in them
+after a restart:
+
+```
+ws save              # before rebooting: snapshot open windows + arm Claude resume
+# ...reboot, relaunch IntelliJ...
+ws restore           # reopen every window; each terminal resumes its Claude session
+```
+
+**How it works.** `ws save` reads IntelliJ's list of currently-open projects
+(`recentProjects.xml`), writes them to `~/.config/ws/sessions/<name>` (default `last`), and for each
+project drops a **resume queue** marker — one `resume <session-id>` line per Claude session that was
+active recently (within `WS_ACTIVE_WINDOW` hours). Each terminal that opens in that folder pops one
+line, so **N terminals restore N distinct Claude sessions**.
+
+Two ways to bring it back:
+- **Automatic (recommended):** turn on IntelliJ ▸ Settings ▸ *Reopen projects on startup* (and it
+  restores each project's terminal tabs). Relaunching IntelliJ reopens the windows + terminals, and
+  the queue markers resume Claude in each — no command needed.
+- **Explicit:** `ws restore [session]` reopens each saved window itself (via the editor), and the
+  terminal resumes Claude. (This path opens one terminal per window; multiple-sessions-per-window
+  relies on IntelliJ's own terminal restore.)
+
+Markers auto-expire after `WS_MARKER_TTL` minutes (default 24h) so a stale snapshot never
+surprise-launches Claude later. `ws sessions` lists what you've saved.
 
 ---
 
@@ -207,6 +240,9 @@ files. Precedence: env > config > defaults.
 | `~/.config/ws/seed/<repo>.txt` | — | Per-repo extra seed files, one path per line. |
 | `WS_EDITOR` | `auto` | `auto` (idea→code→cursor) / `idea` / `code` / `cursor` / `none` / any command. |
 | `WS_IDEA_WAIT` | `15` | macOS: seconds to wait for the IntelliJ window. |
+| `WS_ACTIVE_WINDOW` | `18` | `ws save`: hours — Claude sessions touched within this are "active" and get armed. |
+| `WS_MAX_SESSIONS` | `4` | `ws save`: max Claude sessions to arm per workspace. |
+| `WS_MARKER_TTL` | `1440` | Minutes before an unused resume marker expires (safety). |
 | `WS_NO_UI` | unset | macOS: skip the AppleScript (still opens the editor). |
 | `WS_NO_MERGE` / `WS_NO_TERMINAL` | unset | macOS: skip just the window-merge / terminal step. |
 
