@@ -3,3 +3,4 @@
 *.scpt
 __pycache__/
 *.pyc
+.idea/
